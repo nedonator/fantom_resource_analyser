@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+
+set -e
+
+opwd=$PWD
+
+cd -- "$(dirname "$(readlink "$0" || echo "$0")")"
+
+die() {
+    printf >&2 '%s\n' "$@"
+    exit 1
+}
+
+trace-run() {
+    printf >&2 '[*] %s\n' "$*"
+    "$@"
+}
+
+select-binary() {
+    local arg
+    for arg; do
+        command -v "$arg" && return
+    done
+    die "Found neither of: $*"
+}
+
+if (( $# != 1 )); then
+    die "USAGE: $0 <source file>"
+fi
+
+src=$1
+case "$src" in
+*.c)
+    CLANG=$(select-binary clang clang-6 clang-7)
+    CLANG="$CLANG -std=c99"
+    ;;
+*.cpp|*.cxx)
+    CLANG=$(select-binary clang++ clang++-6 clang++-7)
+    CLANG="$CLANG -std=c++11"
+    ;;
+*)
+    die "Only .c and .cpp/.cxx files are supported."
+    ;;
+esac
+
+LLI=$(select-binary lli lli-7 lli-6)
+
+base=${src%.*}
+base=${base##*/}
+
+case "$src" in
+/*) abs_src=$src ;;
+*) abs_src="$opwd/$src" ;;
+esac
+
+if [ report.c -nt report.ll ]; then
+    trace-run $CLANG -S -emit-llvm report.c
+    trace-run sed 's/$$report/.$report/g' -i report.ll
+fi
+
+trace-run $CLANG -S -emit-llvm "$abs_src"
+
+trace-run sed -rf <(
+printf '%s\n' '
+/^target triple = ".*"$/a\
+@.$counter = internal global i64 0, align 8 \
+; Function Attrs: noinline nounwind optnone uwtable \
+define internal void @".$increment"(i64) #0 { \
+  %2 = alloca i64, align 8 \
+  store i64 %0, i64* %2, align 8 \
+  %3 = load i64, i64* %2, align 8 \
+  %4 = atomicrmw add i64* @.$counter, i64 %3 seq_cst \
+  ret void \
+} \
+; Function Attrs: noinline nounwind optnone uwtable \
+define dso_local i32 @".$profile"() #0 { \
+  %1 = alloca i32, align 4 \
+  %2 = call i32 @main() \
+  store i32 %2, i32* %1, align 4 \
+  %3 = load atomic volatile i64, i64* @.$counter seq_cst, align 8 \
+  call void @".$report"(i64 %3) \
+  %4 = load i32, i32* %1, align 4 \
+  ret i32 %4 \
+} \
+declare dso_local void @".$report"(i64) #1
+'
+    awk '{ print "/^ *(%[0-9]+ = )?" $1 " /i\\\ncall void @\".$increment\"(i64 " $2 ")" }' table
+) -i "$base".ll
+
+trace-run $LLI -extra-module=report.ll -entry-function='.$profile' "$base".ll
